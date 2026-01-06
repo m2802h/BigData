@@ -14,12 +14,23 @@ INFLUX_ORG = os.getenv("INFLUX_ORG", "bigdata")
 INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "bigdata_bucket")
 
 
+def _clean_usid(x) -> str | None:
+    if x is None:
+        return None
+    s = str(x).strip()
+    return s if s else None
+
+
 def _parse_iso(dt_str: str) -> datetime:
     """
-    ORF uses ISO timestamps like: 2026-01-06T13:40:58+01:00
-    We store everything in UTC.
+    Parse ISO timestamps (with timezone) and return UTC.
+    Fallback: now(UTC) if missing or invalid.
     """
+    if not dt_str:
+        return datetime.now(timezone.utc)
     try:
+        # handle "Z" suffix
+        dt_str = dt_str.replace("Z", "+00:00")
         return datetime.fromisoformat(dt_str).astimezone(timezone.utc)
     except Exception:
         return datetime.now(timezone.utc)
@@ -35,22 +46,22 @@ def ping_influx() -> bool:
         return bool(client.ping())
 
 
+
+
 # -------------------------
 # ORF write
 # -------------------------
 def write_orf_articles(items: list[dict]) -> int:
     """
     Measurement: orf_article
-    Tags: category
-    Fields: usid, title, link
-    Time: ORF dc:date
-
-    InfluxDB identifies a point by (measurement + tag set + timestamp).
-    If you write the same point again, it merges/overwrites fields (intended). :contentReference[oaicite:1]{index=1}
+    Tags: category, usid
+    Fields: title, link
+    Time: ORF dc:date (stored in UTC)
     """
     points = []
+
     for it in items:
-        usid = it.get("usid")
+        usid = _clean_usid(it.get("usid"))
         if not usid:
             continue
 
@@ -60,7 +71,7 @@ def write_orf_articles(items: list[dict]) -> int:
         p = (
             Point("orf_article")
             .tag("category", category)
-            .field("usid", str(usid))
+            .tag("usid", usid)
             .field("title", str(it.get("title") or ""))
             .field("link", str(it.get("link") or ""))
             .time(dt)
@@ -71,11 +82,10 @@ def write_orf_articles(items: list[dict]) -> int:
         return 0
 
     with get_client() as client:
-        write_api = client.write_api(write_options=SYNCHRONOUS)
-        write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points)
-
+        client.write_api(write_options=SYNCHRONOUS).write(
+            bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points
+        )
     return len(points)
-
 
 # -------------------------
 # Reddit write
@@ -83,27 +93,27 @@ def write_orf_articles(items: list[dict]) -> int:
 def write_reddit_matches(rows: list[dict]) -> int:
     """
     Measurement: reddit_post
-    Tags: article_usid, source
+    Tags: usid, source
     Fields: reddit_id, title, permalink, url, checked_word_count, group_matches_in_window
-    Time: saved_at_utc (fallback: now)
+    Time: saved_at_utc (fallback: now UTC)
     """
     points = []
     now = datetime.now(timezone.utc)
 
     for r in rows:
-        article_usid = r.get("article_usid")
-        reddit_id = r.get("reddit_id")
-        if not article_usid or not reddit_id:
+        usid = _clean_usid(r.get("article_usid"))
+        reddit_id = _clean_usid(r.get("reddit_id"))
+        if not usid or not reddit_id:
             continue
 
-        dt_raw = (r.get("saved_at_utc") or "").replace("Z", "+00:00")
+        dt_raw = r.get("saved_at_utc") or ""
         dt = _parse_iso(dt_raw) if dt_raw else now
 
         p = (
             Point("reddit_post")
-            .tag("article_usid", str(article_usid))
+            .tag("usid", usid)
             .tag("source", str(r.get("source") or ""))
-            .field("reddit_id", str(reddit_id))
+            .field("reddit_id", reddit_id)
             .field("title", str(r.get("reddit_title") or ""))
             .field("permalink", str(r.get("reddit_permalink") or ""))
             .field("url", str(r.get("post_url") or ""))
@@ -117,7 +127,7 @@ def write_reddit_matches(rows: list[dict]) -> int:
         return 0
 
     with get_client() as client:
-        write_api = client.write_api(write_options=SYNCHRONOUS)
-        write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points)
-
+        client.write_api(write_options=SYNCHRONOUS).write(
+            bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points
+        )
     return len(points)
