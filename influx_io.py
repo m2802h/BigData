@@ -45,6 +45,9 @@ def ping_influx() -> bool:
     with get_client() as client:
         return bool(client.ping())
 
+def _clip(s: str, n: int = 8000) -> str:
+    s = s or ""
+    return s if len(s) <= n else s[:n] + "…"
 
 
 
@@ -119,6 +122,7 @@ def write_reddit_matches(rows: list[dict]) -> int:
             .field("url", str(r.get("post_url") or ""))
             .field("checked_word_count", int(r.get("checked_word_count") or 0))
             .field("group_matches_in_window", int(r.get("group_matches_in_window") or 0))
+            .field("selftext", _clip(str(r.get("reddit_selftext") or ""), 8000))
             .time(dt)
         )
         points.append(p)
