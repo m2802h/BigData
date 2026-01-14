@@ -1,13 +1,18 @@
 import os
 from datetime import datetime, timezone
 
+# InfluxDB Python Client
+# offizieller Client für Schreiben & Lesen von Time-Series-Daten
+
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
 
 # -------------------------
-# Config (via env vars)
+# Configuration (via env vars)
 # -------------------------
+# Konfiguration wird über Environment Variables gelöst
+# wichtig für Docker / Security
 INFLUX_URL = os.getenv("INFLUX_URL", "http://localhost:8086")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "bigdata-dev-token")
 INFLUX_ORG = os.getenv("INFLUX_ORG", "bigdata")
@@ -15,21 +20,33 @@ INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "bigdata_bucket")
 
 
 def _clean_usid(x) -> str | None:
+    """
+    Normalisiert eine USID:
+    - None bleibt None
+    - Whitespace wird entfernt
+    - leere Strings werden verworfen
+    
+    → verhindert ungültige Tags in InfluxDB
+    """
     if x is None:
         return None
     s = str(x).strip()
     return s if s else None
 
 
+
 def _parse_iso(dt_str: str) -> datetime:
     """
-    Parse ISO timestamps (with timezone) and return UTC.
-    Fallback: now(UTC) if missing or invalid.
+    Parst ISO-8601 Zeitstempel und gibt UTC zurück.
+    
+    - unterstützt 'Z' Suffix
+    - Fallback auf aktuelle Zeit bei Fehlern
+    
+    →wichtig für konsistente Zeitachsen in Visualisierungen
     """
     if not dt_str:
         return datetime.now(timezone.utc)
     try:
-        # handle "Z" suffix
         dt_str = dt_str.replace("Z", "+00:00")
         return datetime.fromisoformat(dt_str).astimezone(timezone.utc)
     except Exception:
@@ -37,7 +54,14 @@ def _parse_iso(dt_str: str) -> datetime:
 
 
 def get_client() -> InfluxDBClient:
+    """
+    Erstellt einen neuen InfluxDB client.
+    
+    wird bewusst pro Write-Vorgang verwendet
+    sauberer Ressourcen-Umgang
+    """
     return InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
+
 
 
 def ping_influx() -> bool:
@@ -46,8 +70,14 @@ def ping_influx() -> bool:
         return bool(client.ping())
 
 def _clip(s: str, n: int = 8000) -> str:
+    """
+    Kürzt lange Texte (z.B. Reddit Selftext).
+    
+    InfluxDB Fields haben Größenlimits, verhindert Performance- und Speicherprobleme
+    """
     s = s or ""
     return s if len(s) <= n else s[:n] + "…"
+
 
 
 
@@ -56,6 +86,8 @@ def _clip(s: str, n: int = 8000) -> str:
 # -------------------------
 def write_orf_articles(items: list[dict]) -> int:
     """
+    Schreibt ORF Artikel als Time-Series-Daten.
+    
     Measurement: orf_article
     Tags: category, usid
     Fields: title, link
@@ -66,11 +98,12 @@ def write_orf_articles(items: list[dict]) -> int:
     for it in items:
         usid = _clean_usid(it.get("usid"))
         if not usid:
-            continue
+            continue # ohne USID kein valider Eintrag
 
         dt = _parse_iso(it.get("date") or "")
         category = str(it.get("oewaCategory") or "unknown")
 
+        # Influx: measurement + tags + fields + timestamp
         p = (
             Point("orf_article")
             .tag("category", category)
@@ -83,6 +116,9 @@ def write_orf_articles(items: list[dict]) -> int:
 
     if not points:
         return 0
+    
+
+    # Synchronous Write: garantiert, dass Daten wirklich geschrieben sind
 
     with get_client() as client:
         client.write_api(write_options=SYNCHRONOUS).write(
@@ -95,6 +131,8 @@ def write_orf_articles(items: list[dict]) -> int:
 # -------------------------
 def write_reddit_matches(rows: list[dict]) -> int:
     """
+    Speichert Reddit-Posts, die zu Artikeln passen.
+    
     Measurement: reddit_post
     Tags: usid, source
     Fields: reddit_id, title, permalink, url, checked_word_count, group_matches_in_window
@@ -141,10 +179,13 @@ def write_reddit_matches(rows: list[dict]) -> int:
 
 def write_reddit_stance_updates(rows: list[dict]) -> int:
     """
-    Upsert stance fields onto existing reddit_post points.
+    Aktualisiert NUR die Stance-Felder bestehender Reddit-Posts.
 
-    IMPORTANT: Must use the SAME tags (usid, source) and SAME timestamp (saved_at_utc)
-    as the original reddit_post point, otherwise Influx will create a new point.
+    WICHTIG:
+    - gleiche Tags (usid, source)
+    - gleicher Timestamp (_time)
+    
+    sonst erzeugt InfluxDB einen neuen Datenpunkt
     """
     points = []
     for r in rows:
@@ -152,7 +193,7 @@ def write_reddit_stance_updates(rows: list[dict]) -> int:
         if not usid:
             continue
 
-        # must match the original write time (saved_at_utc -> _time)
+        # muss OG Zeitstempel sein, sonst neuer Punkt
         dt_raw = r.get("saved_at_utc") or r.get("_time") or ""
         dt = _parse_iso(str(dt_raw))
 
