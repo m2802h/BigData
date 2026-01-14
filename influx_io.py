@@ -113,16 +113,57 @@ def write_reddit_matches(rows: list[dict]) -> int:
         dt = _parse_iso(dt_raw) if dt_raw else now
 
         p = (
+        Point("reddit_post")
+        .tag("usid", usid)
+        .tag("source", str(r.get("source") or ""))
+        .field("reddit_id", reddit_id)
+        .field("title", str(r.get("reddit_title") or ""))
+        .field("permalink", str(r.get("reddit_permalink") or ""))
+        .field("url", str(r.get("post_url") or ""))
+        .field("checked_word_count", int(r.get("checked_word_count") or 0))
+        .field("group_matches_in_window", int(r.get("group_matches_in_window") or 0))
+        .field("selftext", _clip(str(r.get("reddit_selftext") or ""), 8000))
+        .field("stance_label", str(r.get("stance_label") or ""))
+        .field("stance_conf", float(r.get("stance_conf") or 0.0))
+        .time(dt)
+        )
+
+        points.append(p)
+
+    if not points:
+        return 0
+
+    with get_client() as client:
+        client.write_api(write_options=SYNCHRONOUS).write(
+            bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points
+        )
+    return len(points)
+
+def write_reddit_stance_updates(rows: list[dict]) -> int:
+    """
+    Upsert stance fields onto existing reddit_post points.
+
+    IMPORTANT: Must use the SAME tags (usid, source) and SAME timestamp (saved_at_utc)
+    as the original reddit_post point, otherwise Influx will create a new point.
+    """
+    points = []
+    for r in rows:
+        usid = _clean_usid(r.get("article_usid") or r.get("usid"))
+        if not usid:
+            continue
+
+        # must match the original write time (saved_at_utc -> _time)
+        dt_raw = r.get("saved_at_utc") or r.get("_time") or ""
+        dt = _parse_iso(str(dt_raw))
+
+        source = str(r.get("source") or "")
+
+        p = (
             Point("reddit_post")
             .tag("usid", usid)
-            .tag("source", str(r.get("source") or ""))
-            .field("reddit_id", reddit_id)
-            .field("title", str(r.get("reddit_title") or ""))
-            .field("permalink", str(r.get("reddit_permalink") or ""))
-            .field("url", str(r.get("post_url") or ""))
-            .field("checked_word_count", int(r.get("checked_word_count") or 0))
-            .field("group_matches_in_window", int(r.get("group_matches_in_window") or 0))
-            .field("selftext", _clip(str(r.get("reddit_selftext") or ""), 8000))
+            .tag("source", source)
+            .field("stance_label", str(r.get("stance_label") or ""))
+            .field("stance_conf", float(r.get("stance_conf") or 0.0))
             .time(dt)
         )
         points.append(p)
