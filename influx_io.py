@@ -1,9 +1,8 @@
 import os
 from datetime import datetime, timezone
+from typing import Iterable
 
 # InfluxDB Python Client
-# offizieller Client für Schreiben & Lesen von Time-Series-Daten
-
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
@@ -11,8 +10,6 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 # -------------------------
 # Configuration (via env vars)
 # -------------------------
-# Konfiguration wird über Environment Variables gelöst
-# wichtig für Docker / Security
 INFLUX_URL = os.getenv("INFLUX_URL", "http://localhost:8086")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "bigdata-dev-token")
 INFLUX_ORG = os.getenv("INFLUX_ORG", "bigdata")
@@ -25,8 +22,6 @@ def _clean_usid(x) -> str | None:
     - None bleibt None
     - Whitespace wird entfernt
     - leere Strings werden verworfen
-    
-    → verhindert ungültige Tags in InfluxDB
     """
     if x is None:
         return None
@@ -34,34 +29,38 @@ def _clean_usid(x) -> str | None:
     return s if s else None
 
 
-
 def _parse_iso(dt_str: str) -> datetime:
     """
     Parst ISO-8601 Zeitstempel und gibt UTC zurück.
-    
     - unterstützt 'Z' Suffix
     - Fallback auf aktuelle Zeit bei Fehlern
-    
-    →wichtig für konsistente Zeitachsen in Visualisierungen
     """
     if not dt_str:
         return datetime.now(timezone.utc)
     try:
-        dt_str = dt_str.replace("Z", "+00:00")
+        dt_str = str(dt_str).replace("Z", "+00:00")
         return datetime.fromisoformat(dt_str).astimezone(timezone.utc)
     except Exception:
         return datetime.now(timezone.utc)
 
 
-def get_client() -> InfluxDBClient:
+def _parse_unix_utc_seconds(x) -> datetime | None:
     """
-    Erstellt einen neuen InfluxDB client.
-    
-    wird bewusst pro Write-Vorgang verwendet
-    sauberer Ressourcen-Umgang
+    Parse unix timestamp (seconds) -> UTC datetime.
+    Returns None if missing/invalid.
+    Uses int seconds to avoid float jitter causing duplicate points.
     """
-    return InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
+    if x is None or x == "":
+        return None
+    try:
+        return datetime.fromtimestamp(int(float(x)), tz=timezone.utc)
+    except Exception:
+        return None
 
+
+def get_client() -> InfluxDBClient:
+    """Erstellt einen neuen InfluxDB client."""
+    return InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
 
 
 def ping_influx() -> bool:
@@ -69,16 +68,27 @@ def ping_influx() -> bool:
     with get_client() as client:
         return bool(client.ping())
 
+
 def _clip(s: str, n: int = 8000) -> str:
     """
     Kürzt lange Texte (z.B. Reddit Selftext).
-    
-    InfluxDB Fields haben Größenlimits, verhindert Performance- und Speicherprobleme
     """
     s = s or ""
     return s if len(s) <= n else s[:n] + "…"
 
 
+# -------------------------
+# Generic helpers
+# -------------------------
+def write_points(points: list[Point]) -> int:
+    """Write a list of points synchronously. Returns number written."""
+    if not points:
+        return 0
+    with get_client() as client:
+        client.write_api(write_options=SYNCHRONOUS).write(
+            bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points
+        )
+    return len(points)
 
 
 # -------------------------
@@ -87,23 +97,22 @@ def _clip(s: str, n: int = 8000) -> str:
 def write_orf_articles(items: list[dict]) -> int:
     """
     Schreibt ORF Artikel als Time-Series-Daten.
-    
+
     Measurement: orf_article
     Tags: category, usid
     Fields: title, link
     Time: ORF dc:date (stored in UTC)
     """
-    points = []
+    points: list[Point] = []
 
     for it in items:
         usid = _clean_usid(it.get("usid"))
         if not usid:
-            continue # ohne USID kein valider Eintrag
+            continue
 
         dt = _parse_iso(it.get("date") or "")
         category = str(it.get("oewaCategory") or "unknown")
 
-        # Influx: measurement + tags + fields + timestamp
         p = (
             Point("orf_article")
             .tag("category", category)
@@ -114,31 +123,63 @@ def write_orf_articles(items: list[dict]) -> int:
         )
         points.append(p)
 
-    if not points:
-        return 0
-    
+    return write_points(points)
 
-    # Synchronous Write: garantiert, dass Daten wirklich geschrieben sind
-
-    with get_client() as client:
-        client.write_api(write_options=SYNCHRONOUS).write(
-            bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points
-        )
-    return len(points)
 
 # -------------------------
-# Reddit write
+# ORF read (added)
+# -------------------------
+def load_orf_articles_from_influx(lookback: str = "1h") -> list[dict]:
+    """
+    Pull ORF articles (measurement 'orf_article') within lookback.
+    Returns deduped list by usid with fields: time, usid, title, link, date.
+    """
+    with get_client() as client:
+        query_api = client.query_api()
+        flux = f"""
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{lookback})
+  |> filter(fn: (r) => r._measurement == "orf_article")
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> keep(columns: ["_time", "usid", "title", "link", "date"])
+"""
+        tables = query_api.query(flux, org=INFLUX_ORG)
+
+    rows: list[dict] = []
+    for t in tables:
+        for rec in t.records:
+            d = rec.values
+            rows.append(
+                {
+                    "time": d.get("_time"),
+                    "usid": d.get("usid"),
+                    "title": d.get("title"),
+                    "link": d.get("link"),
+                    "date": d.get("date"),
+                }
+            )
+
+    dedup: dict[str, dict] = {}
+    for r in rows:
+        u = _clean_usid(r.get("usid"))
+        if u and u not in dedup:
+            dedup[u] = r
+    return list(dedup.values())
+
+
+# -------------------------
+# Reddit write (existing)
 # -------------------------
 def write_reddit_matches(rows: list[dict]) -> int:
     """
     Speichert Reddit-Posts, die zu Artikeln passen.
-    
+
     Measurement: reddit_post
     Tags: usid, source
     Fields: reddit_id, title, permalink, url, checked_word_count, group_matches_in_window
     Time: saved_at_utc (fallback: now UTC)
     """
-    points = []
+    points: list[Point] = []
     now = datetime.now(timezone.utc)
 
     for r in rows:
@@ -151,31 +192,24 @@ def write_reddit_matches(rows: list[dict]) -> int:
         dt = _parse_iso(dt_raw) if dt_raw else now
 
         p = (
-        Point("reddit_post")
-        .tag("usid", usid)
-        .tag("source", str(r.get("source") or ""))
-        .field("reddit_id", reddit_id)
-        .field("title", str(r.get("reddit_title") or ""))
-        .field("permalink", str(r.get("reddit_permalink") or ""))
-        .field("url", str(r.get("post_url") or ""))
-        .field("checked_word_count", int(r.get("checked_word_count") or 0))
-        .field("group_matches_in_window", int(r.get("group_matches_in_window") or 0))
-        .field("selftext", _clip(str(r.get("reddit_selftext") or ""), 8000))
-        .field("stance_label", str(r.get("stance_label") or ""))
-        .field("stance_conf", float(r.get("stance_conf") or 0.0))
-        .time(dt)
+            Point("reddit_post")
+            .tag("usid", usid)
+            .tag("source", str(r.get("source") or ""))
+            .field("reddit_id", reddit_id)
+            .field("title", str(r.get("reddit_title") or ""))
+            .field("permalink", str(r.get("reddit_permalink") or ""))
+            .field("url", str(r.get("post_url") or ""))
+            .field("checked_word_count", int(r.get("checked_word_count") or 0))
+            .field("group_matches_in_window", int(r.get("group_matches_in_window") or 0))
+            .field("selftext", _clip(str(r.get("reddit_selftext") or ""), 8000))
+            .field("stance_label", str(r.get("stance_label") or ""))
+            .field("stance_conf", float(r.get("stance_conf") or 0.0))
+            .time(dt)
         )
-
         points.append(p)
 
-    if not points:
-        return 0
+    return write_points(points)
 
-    with get_client() as client:
-        client.write_api(write_options=SYNCHRONOUS).write(
-            bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points
-        )
-    return len(points)
 
 def write_reddit_stance_updates(rows: list[dict]) -> int:
     """
@@ -184,16 +218,15 @@ def write_reddit_stance_updates(rows: list[dict]) -> int:
     WICHTIG:
     - gleiche Tags (usid, source)
     - gleicher Timestamp (_time)
-    
     sonst erzeugt InfluxDB einen neuen Datenpunkt
     """
-    points = []
+    points: list[Point] = []
+
     for r in rows:
         usid = _clean_usid(r.get("article_usid") or r.get("usid"))
         if not usid:
             continue
 
-        # muss OG Zeitstempel sein, sonst neuer Punkt
         dt_raw = r.get("saved_at_utc") or r.get("_time") or ""
         dt = _parse_iso(str(dt_raw))
 
@@ -209,11 +242,93 @@ def write_reddit_stance_updates(rows: list[dict]) -> int:
         )
         points.append(p)
 
-    if not points:
-        return 0
+    return write_points(points)
+
+
+# -------------------------
+# Reddit dedup read (added)
+# -------------------------
+def load_existing_reddit_ids_for_usid(usid: str, lookback: str = "365d") -> set[str]:
+    """
+    Fetch already-written reddit_id values for a given usid to avoid duplicates.
+    Note: reddit_id is stored as a FIELD in your schema, so we filter _field == "reddit_id".
+    """
+    usid = _clean_usid(usid)
+    if not usid:
+        return set()
 
     with get_client() as client:
-        client.write_api(write_options=SYNCHRONOUS).write(
-            bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points
+        query_api = client.query_api()
+        flux = f"""
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{lookback})
+  |> filter(fn: (r) => r._measurement == "reddit_post")
+  |> filter(fn: (r) => r.usid == "{usid}")
+  |> filter(fn: (r) => r._field == "reddit_id")
+  |> keep(columns: ["_value"])
+  |> distinct(column: "_value")
+"""
+        tables = query_api.query(flux, org=INFLUX_ORG)
+
+    out: set[str] = set()
+    for t in tables:
+        for rec in t.records:
+            v = rec.values.get("_value")
+            if v is not None:
+                out.add(str(v))
+    return out
+
+
+# -------------------------
+# Reddit write for "matcher rows" (added)
+# -------------------------
+def reddit_rows_to_points(rows: Iterable[dict]) -> list[Point]:
+    """
+    Converts rows from your Reddit search/matcher cell into Points.
+
+    Expected row keys (from your matcher):
+      usid, source, reddit_id, reddit_title, reddit_permalink, post_url,
+      reddit_selftext, checked_word_count, group_matches_in_window, created_utc
+
+    Timestamp:
+      uses created_utc (unix seconds) deterministically (int seconds).
+      rows without created_utc are skipped (otherwise you create new points each run).
+    """
+    points: list[Point] = []
+
+    for r in rows:
+        usid = _clean_usid(r.get("usid"))
+        reddit_id = _clean_usid(r.get("reddit_id"))
+        if not usid or not reddit_id:
+            continue
+
+        dt = _parse_unix_utc_seconds(r.get("created_utc"))
+        if dt is None:
+            # skip to keep writes idempotent; otherwise now() creates duplicates on reruns
+            continue
+
+        p = (
+            Point("reddit_post")
+            .tag("usid", usid)
+            .tag("source", str(r.get("source") or ""))
+            .field("reddit_id", reddit_id)
+            .field("title", str(r.get("reddit_title") or ""))
+            .field("permalink", str(r.get("reddit_permalink") or ""))
+            .field("url", str(r.get("post_url") or ""))
+            .field("checked_word_count", int(r.get("checked_word_count") or 0))
+            .field("group_matches_in_window", int(r.get("group_matches_in_window") or 0))
+            .field("selftext", _clip(str(r.get("reddit_selftext") or ""), 8000))
+            .time(dt)
         )
-    return len(points)
+        points.append(p)
+
+    return points
+
+
+def write_reddit_posts(rows: list[dict]) -> int:
+    """
+    Writes reddit posts for the matcher cell row format (see reddit_rows_to_points()).
+    Dedup should be done outside (e.g., using load_existing_reddit_ids_for_usid).
+    """
+    points = reddit_rows_to_points(rows)
+    return write_points(points)
