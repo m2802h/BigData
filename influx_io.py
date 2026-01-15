@@ -365,3 +365,95 @@ from(bucket: "{INFLUX_BUCKET}")
             })
 
     return pd.DataFrame(rows)
+
+# -------------------------
+# Analytics reads (for notebooks / evaluation)
+# -------------------------
+def query_df(flux: str) -> pd.DataFrame:
+    """Run a Flux query and return a single concatenated DataFrame."""
+    with get_client() as client:
+        df = client.query_api().query_data_frame(flux, org=INFLUX_ORG)
+    if isinstance(df, list):
+        df = pd.concat(df, ignore_index=True) if df else pd.DataFrame()
+    return df
+
+
+def load_orf_titles_df(lookback: str = "30d", limit: int = 5000) -> pd.DataFrame:
+    """
+    Loads ORF articles (measurement 'orf_article').
+
+    Returns df with columns:
+      usid, orf_time, orf_title, category, link
+    """
+    flux = f"""
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{lookback})
+  |> filter(fn: (r) => r._measurement == "orf_article")
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> keep(columns: ["_time","usid","title","category","link"])
+  |> sort(columns: ["_time"], desc: true)
+  |> limit(n: {int(limit)})
+"""
+    df = query_df(flux)
+    if df.empty:
+        return df
+
+    df = df.rename(columns={"_time": "orf_time", "title": "orf_title"})
+    df["usid"] = df["usid"].astype(str).str.strip()
+    df["orf_title"] = df["orf_title"].fillna("").astype(str)
+
+    # Some older points may have missing category/link; keep columns stable
+    for col in ["category", "link"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df[["usid", "orf_time", "orf_title", "category", "link"]].drop_duplicates(subset=["usid"])
+
+
+def load_reddit_posts_df(lookback: str = "30d", limit: int = 20000) -> pd.DataFrame:
+    """
+    Loads reddit posts (measurement 'reddit_post').
+
+    Returns df with columns:
+      usid, reddit_time, reddit_id, reddit_title, selftext, source, stance_label, stance_conf
+    """
+    flux = f"""
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{lookback})
+  |> filter(fn: (r) => r._measurement == "reddit_post")
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> keep(columns: ["_time","usid","source","reddit_id","title","selftext","stance_label","stance_conf"])
+  |> sort(columns: ["_time"], desc: true)
+  |> limit(n: {int(limit)})
+"""
+    df = query_df(flux)
+    if df.empty:
+        return df
+
+    df = df.rename(columns={"_time": "reddit_time", "title": "reddit_title"})
+    df["usid"] = df["usid"].astype(str).str.strip()
+    df["reddit_id"] = df.get("reddit_id", "").fillna("").astype(str)
+    df["reddit_title"] = df.get("reddit_title", "").fillna("").astype(str)
+    df["selftext"] = df.get("selftext", "").fillna("").astype(str)
+    df["source"] = df.get("source", "").fillna("").astype(str)
+    df["stance_label"] = df.get("stance_label", "").fillna("").astype(str)
+    df["stance_conf"] = pd.to_numeric(df.get("stance_conf", 0.0), errors="coerce").fillna(0.0)
+
+    # Drop rows without reddit_id (shouldn't happen, but avoids weird joins)
+    df = df[df["reddit_id"].str.len() > 0].copy()
+    return df
+
+
+def load_reddit_posts_with_labels_df(lookback: str = "30d", limit: int = 10000) -> pd.DataFrame:
+    """
+    Loads reddit posts that already have a non-empty stance_label.
+
+    Returns df with columns (at least):
+      reddit_time, usid, source, reddit_id, reddit_title, selftext, stance_label, stance_conf
+    """
+    df = load_reddit_posts_df(lookback=lookback, limit=limit)
+    if df.empty:
+        return df
+    # treat missing as empty and filter
+    df["stance_label"] = df["stance_label"].fillna("").astype(str)
+    return df[df["stance_label"].str.len() > 0].copy()
