@@ -57,6 +57,32 @@ def _parse_unix_utc_seconds(x) -> datetime | None:
     except Exception:
         return None
 
+def load_seen_usids_from_influx(lookback: str = "30d") -> set[str]:
+    """
+    Pull distinct usid tag values stored in measurement 'orf_article'
+    within a recent lookback window.
+    """
+    with get_client() as client:
+        query_api = client.query_api()
+
+        flux = f'''
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{lookback})
+  |> filter(fn: (r) => r._measurement == "orf_article")
+  |> keep(columns: ["usid"])
+  |> distinct(column: "usid")
+'''
+
+        tables = query_api.query(flux, org=INFLUX_ORG)
+
+    seen = set()
+    for table in tables:
+        for record in table.records:
+            val = record.values.get("usid")
+            if val:
+                seen.add(str(val))
+    return seen
+
 
 def get_client() -> InfluxDBClient:
     """Erstellt einen neuen InfluxDB client."""
@@ -126,6 +152,7 @@ def write_orf_articles(items: list[dict]) -> int:
     return write_points(points)
 
 
+
 # -------------------------
 # ORF read (added)
 # -------------------------
@@ -170,6 +197,52 @@ from(bucket: "{INFLUX_BUCKET}")
 # -------------------------
 # Reddit write (existing)
 # -------------------------
+def load_reddit_posts_from_influx(lookback: str = "30d") -> pd.DataFrame:
+    """
+    Loads measurement 'reddit_post' from InfluxDB for inspection.
+    reddit_id/title/permalink/url/selftext are written as FIELDS; usid/source are tags.
+    """
+    with get_client() as client:
+        query_api = client.query_api()
+        flux = f"""
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{lookback})
+  |> filter(fn: (r) => r._measurement == "reddit_post")
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> keep(columns: ["_time","usid","source","reddit_id","title","permalink","url","checked_word_count","group_matches_in_window","selftext"])
+"""
+        tables = query_api.query(flux, org=INFLUX_ORG)
+
+    rows = []
+    for t in tables:
+        for rec in t.records:
+            v = rec.values
+            rows.append({
+                "_time": v.get("_time"),
+                "usid": v.get("usid"),
+                "source": v.get("source"),
+                "reddit_id": v.get("reddit_id"),
+                "title": v.get("title"),
+                "permalink": v.get("permalink"),
+                "url": v.get("url"),
+                "checked_word_count": v.get("checked_word_count"),
+                "group_matches_in_window": v.get("group_matches_in_window"),
+                "selftext": v.get("selftext"),
+            })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        print("No reddit_post points found in Influx for lookback =", lookback)
+        return df
+
+    # normalize numeric columns
+    df["checked_word_count"] = pd.to_numeric(df["checked_word_count"], errors="coerce").fillna(0).astype(int)
+    df["group_matches_in_window"] = pd.to_numeric(df["group_matches_in_window"], errors="coerce").fillna(0).astype(int)
+
+    # sort: most recent first within each usid
+    df = df.sort_values(["usid", "_time"], ascending=[True, False])
+    return df
+
 def write_reddit_matches(rows: list[dict]) -> int:
     """
     Speichert Reddit-Posts, die zu Artikeln passen.
