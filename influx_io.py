@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timezone
 from typing import Iterable
-
+import pandas as pd
 # InfluxDB Python Client
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
@@ -332,3 +332,36 @@ def write_reddit_posts(rows: list[dict]) -> int:
     """
     points = reddit_rows_to_points(rows)
     return write_points(points)
+
+def load_unlabeled_reddit_posts_from_influx(lookback: str = "30d", limit: int = 500) -> pd.DataFrame:
+    """
+    Pull reddit_post points where stance_label is missing or empty.
+    Returns a dataframe with: _time, usid, source, title, selftext, stance_label
+    """
+    with get_client() as client:
+        query_api = client.query_api()
+        flux = f"""
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{lookback})
+  |> filter(fn: (r) => r._measurement == "reddit_post")
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> keep(columns: ["_time","usid","source","title","selftext","stance_label"])
+  |> filter(fn: (r) => (not exists r.stance_label) or r.stance_label == "")
+  |> limit(n: {int(limit)})
+"""
+        tables = query_api.query(flux, org=INFLUX_ORG)
+
+    rows = []
+    for t in tables:
+        for rec in t.records:
+            v = rec.values
+            rows.append({
+                "_time": v.get("_time"),
+                "usid": v.get("usid"),
+                "source": v.get("source"),
+                "title": v.get("title") or "",
+                "selftext": v.get("selftext") or "",
+                "stance_label": v.get("stance_label") or "",
+            })
+
+    return pd.DataFrame(rows)
